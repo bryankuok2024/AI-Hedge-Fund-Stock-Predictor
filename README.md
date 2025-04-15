@@ -124,9 +124,13 @@ Select "Backtest" mode, enter tickers, and the desired date range. Advanced opti
 After running, the backtest displays key performance indicators, such as Total Return %, Sharpe Ratio, Maximum Drawdown, Win Rate, etc., summarizing the strategy's historical performance.
 ![Backtest Performance Metrics](img/6.png)
 
-**3. Trade Log & Portfolio Value:**
-A detailed Trade Log shows the actions taken on each day for each ticker, along with portfolio state (shares owned, position value, cash). A Portfolio Value Chart visually represents the growth (or decline) of the simulated portfolio over the backtest period.
-![Backtest Trade Log and Chart](img/7.png)
+**3. Trade Log:**
+A detailed Trade Log shows the actions taken on each day for each ticker, along with portfolio state (shares owned, position value, cash).
+![Backtest Trade Log](img/7.png)
+
+**4. Portfolio Value Chart:**
+A Portfolio Value Chart visually represents the growth (or decline) of the simulated portfolio over the backtest period.
+![Backtest Portfolio Value Chart](img/8.png)
 
 ## Running with Docker (Recommended for Consistent Environment)
 
