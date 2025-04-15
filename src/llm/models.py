@@ -1,6 +1,5 @@
 import os
 from langchain_anthropic import ChatAnthropic
-from langchain_deepseek import ChatDeepSeek
 from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_groq import ChatGroq
 from langchain_openai import ChatOpenAI
@@ -31,11 +30,11 @@ class LLMModel(BaseModel):
     
     def has_json_mode(self) -> bool:
         """Check if the model supports JSON mode"""
-        return not self.is_deepseek() and not self.is_gemini()
+        return self.provider not in [ModelProvider.GEMINI]
     
     def is_deepseek(self) -> bool:
-        """Check if the model is a DeepSeek model"""
-        return self.model_name.startswith("deepseek")
+        """Check if the model is a DeepSeek model (based on provider enum)"""
+        return self.provider == ModelProvider.DEEPSEEK
     
     def is_gemini(self) -> bool:
         """Check if the model is a Gemini model"""
@@ -133,7 +132,13 @@ def get_model(model_name: str, model_provider: ModelProvider) -> ChatOpenAI | Ch
             # Print error to console
             print(f"API Key Error: Please make sure OPENAI_API_KEY is set in your .env file.")
             raise ValueError("OpenAI API key not found.  Please make sure OPENAI_API_KEY is set in your .env file.")
-        return ChatOpenAI(model=model_name, api_key=api_key)
+        # Check for custom base URL
+        base_url = os.getenv("OPENAI_API_BASE")
+        if base_url:
+             print(f"Using custom OpenAI base URL: {base_url}")
+             return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url)
+        else:
+             return ChatOpenAI(model=model_name, api_key=api_key)
     elif model_provider == ModelProvider.ANTHROPIC:
         api_key = os.getenv("ANTHROPIC_API_KEY")
         if not api_key:
@@ -145,10 +150,30 @@ def get_model(model_name: str, model_provider: ModelProvider) -> ChatOpenAI | Ch
         if not api_key:
             print(f"API Key Error: Please make sure DEEPSEEK_API_KEY is set in your .env file.")
             raise ValueError("DeepSeek API key not found.  Please make sure DEEPSEEK_API_KEY is set in your .env file.")
-        return ChatDeepSeek(model=model_name, api_key=api_key)
+        base_url="https://api.deepseek.com/v1"
+        print(f"INFO: Initializing DeepSeek model '{model_name}' via OpenAI wrapper with base URL: {base_url}")
+        return ChatOpenAI(model=model_name, api_key=api_key, base_url=base_url)
     elif model_provider == ModelProvider.GEMINI:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
             print(f"API Key Error: Please make sure GOOGLE_API_KEY is set in your .env file.")
             raise ValueError("Google API key not found.  Please make sure GOOGLE_API_KEY is set in your .env file.")
         return ChatGoogleGenerativeAI(model=model_name, api_key=api_key)
+
+# Add a function to get default model configuration
+def get_default_model() -> LLMModel:
+    """Returns the default model configuration (e.g., DeepSeek R1)."""
+    # Find DeepSeek R1 in the AVAILABLE_MODELS list
+    default_model = next((
+        model for model in AVAILABLE_MODELS 
+        if model.model_name == "deepseek-reasoner" and model.provider == ModelProvider.DEEPSEEK
+    ), None)
+    
+    # Fallback to the first available model if DeepSeek R1 is somehow not found
+    if not default_model and AVAILABLE_MODELS:
+        print("Warning: Default model 'deepseek-reasoner' not found. Falling back to the first available model.")
+        default_model = AVAILABLE_MODELS[0]
+    elif not AVAILABLE_MODELS:
+         raise ValueError("No models defined in AVAILABLE_MODELS.")
+         
+    return default_model

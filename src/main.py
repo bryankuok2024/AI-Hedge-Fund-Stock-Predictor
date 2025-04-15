@@ -1,4 +1,5 @@
 import sys
+import time # Import time module
 
 from dotenv import load_dotenv
 from langchain_core.messages import HumanMessage
@@ -13,12 +14,13 @@ from agents.technicals import technical_analyst_agent
 from agents.risk_manager import risk_management_agent
 from agents.sentiment import sentiment_agent
 from agents.warren_buffett import warren_buffett_agent
-from graph.state import AgentState
 from agents.valuation import valuation_agent
+from agents.quantitative_analyst import run_quantitative_analysis
+from graph.state import AgentState
 from utils.display import print_trading_output
 from utils.analysts import ANALYST_ORDER, get_analyst_nodes
 from utils.progress import progress
-from llm.models import LLM_ORDER, get_model_info
+from llm.models import LLM_ORDER, get_model_info, get_default_model
 import io
 import contextlib
 import json
@@ -41,40 +43,63 @@ print(f"DEBUG: OPENAI_API_BASE loaded: {os.getenv('OPENAI_API_BASE', 'Not Found'
 init(autoreset=True)
 
 
-def create_workflow(selected_analysts=None):
-    """Create the workflow with selected analysts."""
+def create_workflow(selected_llm_analysts=None):
+    """Create the workflow ONLY with selected LLM analysts."""
     workflow = StateGraph(AgentState)
     workflow.add_node("start_node", start)
 
-    # Get analyst nodes from the configuration
-    analyst_nodes = get_analyst_nodes()
+    # Get all available analyst nodes from the configuration
+    all_analyst_nodes = get_analyst_nodes()
 
-    # Default to all analysts if none selected or empty list passed
-    if not selected_analysts:
-        selected_analysts = list(analyst_nodes.keys())
+    # Filter the nodes to include only the selected LLM analysts
+    if selected_llm_analysts:
+        # Corrected logic for building analysts_to_add
+        analysts_to_add = {}
+        for selected_key_with_suffix in selected_llm_analysts:
+            # Derive the key used for lookup (remove _agent suffix)
+            lookup_key_no_suffix = selected_key_with_suffix.replace("_agent", "")
+            
+            # Check if the key without suffix exists in the node dictionary
+            if lookup_key_no_suffix in all_analyst_nodes:
+                # Add the node info using the key WITHOUT the suffix
+                analysts_to_add[lookup_key_no_suffix] = all_analyst_nodes[lookup_key_no_suffix]
+            else:
+                 print(f"Warning: Could not find node info for selected key: {selected_key_with_suffix} (lookup key: {lookup_key_no_suffix})")
+                 
+        if not analysts_to_add:
+            print("Warning: No valid LLM analysts selected or found after lookup. Only running Risk/Portfolio Managers.")
+    else:
+        # If no specific LLM analysts are selected (e.g., if selected_analysts only contained non-LLM agents),
+        # then only run the mandatory managers.
+        analysts_to_add = {}
+        print("Info: No LLM analysts selected. Running only Risk/Portfolio Managers.")
 
-    # Add selected analyst nodes
-    for analyst_key in selected_analysts:
-        # Handle potential KeyError if an invalid analyst key is passed
-        if analyst_key in analyst_nodes:
-            node_name, node_func = analyst_nodes[analyst_key]
-            workflow.add_node(node_name, node_func)
-            workflow.add_edge("start_node", node_name)
-        else:
-            print(f"Warning: Analyst key '{analyst_key}' not found in configuration. Skipping.")
+    # Add selected LLM analyst nodes
+    for analyst_key, (node_name, node_func) in analysts_to_add.items():
+        workflow.add_node(node_name, node_func)
+        workflow.add_edge("start_node", node_name)
+        print(f"  Adding LLM agent node: {node_name}") # Debug print
 
     # Always add risk and portfolio management
     workflow.add_node("risk_management_agent", risk_management_agent)
     workflow.add_node("portfolio_management_agent", portfolio_management_agent)
+    print(f"  Adding mandatory node: risk_management_agent")
+    print(f"  Adding mandatory node: portfolio_management_agent")
 
-    # Connect selected analysts to risk management
-    for analyst_key in selected_analysts:
-        if analyst_key in analyst_nodes: # Check again to avoid errors if skipped above
-            node_name = analyst_nodes[analyst_key][0]
+    # Connect selected LLM analysts to risk management
+    if analysts_to_add: # Only connect if there were LLM analysts
+        for node_name, _ in analysts_to_add.values():
             workflow.add_edge(node_name, "risk_management_agent")
+            print(f"  Connecting edge: {node_name} -> risk_management_agent")
+    else:
+        # If no LLM analysts were added, connect start directly to risk management
+        workflow.add_edge("start_node", "risk_management_agent")
+        print(f"  Connecting edge: start_node -> risk_management_agent")
 
     workflow.add_edge("risk_management_agent", "portfolio_management_agent")
     workflow.add_edge("portfolio_management_agent", END)
+    print(f"  Connecting edge: risk_management_agent -> portfolio_management_agent")
+    print(f"  Connecting edge: portfolio_management_agent -> END")
 
     workflow.set_entry_point("start_node")
     return workflow
@@ -117,7 +142,7 @@ def run_hedge_fund_core(
     end_date: str,
     portfolio: dict,
     show_reasoning: bool = False,
-    selected_analysts: list[str] = None, # Changed default to None
+    selected_analysts: list[str] = None, # Receives list like ["warren_buffett_agent", "quantitative_analyst"]
     model_name: str = "gpt-4o",
     model_provider: str = "OpenAI",
 ):
@@ -125,14 +150,71 @@ def run_hedge_fund_core(
     # Start progress tracking (if needed, consider making it optional for non-CLI)
     # progress.start() # Commented out for now, might add too much noise in webapp
 
+    all_agent_outputs = {} # Initialize dict to store outputs from all agents
+    final_state = None # Initialize final_state to None
+
+    # Determine the full list of available agents (keys) from config or another source if needed
+    # For now, let's assume we know the keys or can infer them.
+    all_available_analyst_keys = list(get_analyst_nodes().keys()) + ["quantitative_analyst"] # Add non-LLM agents explicitly
+
+    # If selected_analysts is None or empty, default to ALL available agents
+    if not selected_analysts:
+        # Default case: Ensure keys have the _agent suffix where appropriate
+        current_selected_analysts = [ 
+            key + "_agent" if key != "quantitative_analyst" and not key.endswith("_agent") else key 
+            for key in all_available_analyst_keys 
+        ]
+        print(f"No specific analysts selected, running all: {current_selected_analysts}")
+    else:
+        # User provided selection: Ensure keys have the _agent suffix where appropriate
+        # Handles keys coming from UI potentially without suffix
+        current_selected_analysts = [
+            key + "_agent" if key != "quantitative_analyst" and not key.endswith("_agent") else key 
+            for key in selected_analysts
+        ]
+        print(f"Running selected analysts (normalized keys): {current_selected_analysts}")
+
     try:
-        # Create and compile the workflow based on selected analysts
-        # Use default analysts if None or empty list is provided
-        current_selected_analysts = selected_analysts if selected_analysts else list(get_analyst_nodes().keys())
-        workflow = create_workflow(current_selected_analysts)
+        # --- Run Non-LangGraph Agents First (if selected) ---
+        print("\n--- Checking Non-LLM Agents ---")
+        if "quantitative_analyst" in current_selected_analysts:
+            print("Quantitative Analyst is selected. Running...")
+            for ticker in tickers:
+                print(f"  Running Quantitative Analyst for {ticker}...")
+                qa_output = run_quantitative_analysis(ticker, start_date, end_date)
+                # Store the output under a consistent key, e.g., 'quantitative_analyst'
+                if 'quantitative_analyst' not in all_agent_outputs:
+                    all_agent_outputs['quantitative_analyst'] = {}
+                all_agent_outputs['quantitative_analyst'][ticker] = qa_output
+                if qa_output.get("error"):
+                    print(f"    {Fore.RED}Error in Quantitative Analyst for {ticker}: {qa_output['error']}{Style.RESET_ALL}")
+                else:
+                    print(f"    Quantitative Analyst for {ticker} completed.")
+        else:
+            print("Quantitative Analyst was not selected.")
+
+        # --- Identify selected LLM agents to pass to LangGraph --- 
+        # Assumes get_analyst_nodes() returns only LLM agents manageable by LangGraph
+        llm_agent_keys = list(get_analyst_nodes().keys()) # Keys likely WITHOUT _agent suffix
+        # FIX: Adjust comparison to handle suffix mismatch
+        selected_llm_analysts = [ 
+            key for key in current_selected_analysts 
+            if key == "quantitative_analyst" or # Keep quant analyst out of LLM list
+               (key.endswith("_agent") and key.replace("_agent", "") in llm_agent_keys) or # Check key without suffix
+               (not key.endswith("_agent") and key in llm_agent_keys) # Handle edge cases if suffix logic changes
+        ]
+        # Filter again to only include keys actually meant for the LLM workflow
+        selected_llm_analysts = [k for k in selected_llm_analysts if k in llm_agent_keys or (k.endswith("_agent") and k.replace("_agent","") in llm_agent_keys)]
+        
+        print(f"Selected LLM agents for workflow: {selected_llm_analysts}")
+
+        # --- Run LangGraph Workflow for SELECTED LLM-based Agents --- 
+        print("\n--- Running LLM-based Agent Workflow ---")
+        # Create and compile the workflow ONLY with selected LLM analysts
+        workflow = create_workflow(selected_llm_analysts) 
         agent = workflow.compile()
 
-        # Prepare initial state
+        # Prepare initial state (remains the same, agents inside the graph will use metadata)
         initial_state = {
             "messages": [
                 HumanMessage(
@@ -153,29 +235,85 @@ def run_hedge_fund_core(
             },
         }
 
-        # Invoke the agent graph
+        # --- Add Timing Logic --- 
+        print(f"\n--- [TIME LOG] Invoking agent workflow for {tickers} ({start_date} to {end_date}) ---")
+        print(f"--- [TIME LOG] Using Model: {model_provider} / {model_name}")
+        start_time = time.time()
+        # ------------------------
+        
         final_state = agent.invoke(initial_state)
+        
+        # --- Add Timing Logic --- 
+        end_time = time.time()
+        duration = end_time - start_time
+        print(f"--- [TIME LOG] Workflow finished. Duration: {duration:.2f} seconds ---")
+        # ------------------------
 
         # Ensure final_state and messages exist before accessing
         if not final_state or "messages" not in final_state or not final_state["messages"]:
             print("Error: Agent invocation did not return expected final state or messages.")
-            return {"error": "Agent invocation failed", "details": "Missing final state or messages"}
+            # Combine outputs before returning error
+            combined_outputs = {
+                **all_agent_outputs, # Add non-LLM agent outputs
+                **(final_state.get("data", {}).get("analyst_signals", {}) if final_state else {})
+            }
+            return {
+                "error": "Agent invocation failed",
+                "details": "Missing final state or messages",
+                "analyst_signals": combined_outputs
+            }
 
-        # Parse the last message content
+        # Parse the last message content (Portfolio Manager decisions)
         last_message_content = final_state["messages"][-1].content
         decisions = parse_hedge_fund_response(last_message_content)
 
-        # Ensure analyst_signals exists in the final state data
-        analyst_signals = final_state.get("data", {}).get("analyst_signals", {})
+        # Ensure analyst_signals exists in the final state data (LLM agents)
+        llm_analyst_signals = final_state.get("data", {}).get("analyst_signals", {})
+
+        # --- DEBUG: Print data before final combination ---
+        # print("--- DEBUG (main.py): Data before final combination ---")
+        # print(f"DEBUG: current_selected_analysts: {current_selected_analysts}")
+        # print("DEBUG: all_agent_outputs (non-LLM):")
+        # print(json.dumps(all_agent_outputs, indent=2))
+        # print("DEBUG: llm_analyst_signals (from final_state):")
+        # print(json.dumps(llm_analyst_signals, indent=2))
+        # ---------------------------------------------------
+        
+        # Make sure to only include signals from the agents that actually ran
+        combined_signals = { 
+            agent_key: signals 
+            for agent_key, signals in {**all_agent_outputs, **llm_analyst_signals}.items() 
+            if agent_key in current_selected_analysts # Filter based on original selection
+        }
 
         return {
             "decisions": decisions,
-            "analyst_signals": analyst_signals,
+            "analyst_signals": combined_signals, # Return combined signals
         }
     except Exception as e:
+        import traceback # Import here for broader exception coverage
         print(f"Error during hedge fund execution: {e}")
-        # Consider more specific error handling/logging
-        return {"error": "Hedge fund execution failed", "details": str(e)}
+        traceback.print_exc() # Print full traceback
+        # Combine outputs even if there's an error
+        llm_analyst_signals_error = (final_state.get("data", {}).get("analyst_signals", {}) if final_state else {})
+        # --- DEBUG: Print data before combining on error ---
+        # print("--- DEBUG (main.py): Data before combining on error ---")
+        # print(f"DEBUG: current_selected_analysts: {current_selected_analysts}")
+        # print("DEBUG: all_agent_outputs (non-LLM):")
+        # print(json.dumps(all_agent_outputs, indent=2))
+        # print("DEBUG: llm_analyst_signals (from final_state on error):")
+        # print(json.dumps(llm_analyst_signals_error, indent=2))
+        # ---------------------------------------------------
+        combined_outputs = { 
+            agent_key: signals 
+            for agent_key, signals in {**all_agent_outputs, **llm_analyst_signals_error}.items()
+            if agent_key in current_selected_analysts # Filter based on original selection
+        }
+        return {
+            "error": "Hedge fund execution failed",
+            "details": str(e),
+            "analyst_signals": combined_outputs # Return partial signals if available
+        }
     # finally:
         # Stop progress tracking
         # progress.stop() # Commented out
@@ -276,9 +414,10 @@ if __name__ == "__main__":
             selected_analysts = choices
             print(f"\nSelected analysts: {', '.join(Fore.GREEN + choice.title().replace('_', ' ') + Style.RESET_ALL for choice in selected_analysts)}\n")
 
-    # Select LLM model
+    # --- Model Selection --- 
+    default_model_config = get_default_model() # Get default model config
     model_choice = None
-    model_provider = "Unknown" # Default provider
+    model_provider = "Unknown"
     if args.model:
         model_choice = args.model
         model_info = get_model_info(model_choice)
@@ -288,10 +427,11 @@ if __name__ == "__main__":
         else:
             print(f"\nUsing specified model (provider unknown): {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
     else:
-        # Interactive model selection only if --model not provided
+        # Interactive model selection
         model_choice_q = questionary.select(
             "Select your LLM model:",
             choices=[questionary.Choice(display, value=value) for display, value, _ in LLM_ORDER],
+            default=default_model_config.model_name, # Use default model name here
             style=questionary.Style([
                 ("selected", "fg:green bold"),
                 ("pointer", "fg:green bold"),
@@ -299,7 +439,6 @@ if __name__ == "__main__":
                 ("answer", "fg:green bold"),
             ])
         ).ask()
-
         if not model_choice_q:
             print("\n\nInterrupt received. Exiting...")
             sys.exit(0)
@@ -310,7 +449,6 @@ if __name__ == "__main__":
                 model_provider = model_info.provider.value
                 print(f"\nSelected {Fore.CYAN}{model_provider}{Style.RESET_ALL} model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
             else:
-                # Keep provider as Unknown if info not found
                 print(f"\nSelected model: {Fore.GREEN + Style.BRIGHT}{model_choice}{Style.RESET_ALL}\n")
 
     # Show agent graph if requested (needs compiled app)
@@ -396,9 +534,11 @@ if __name__ == "__main__":
         if "response" in results and results["response"]:
             print(f"{Fore.RED}Agent Response causing error: {results['response']}")
 
-    elif results and "decisions" in results:
-        print_trading_output(results["decisions"], results["analyst_signals"])
+    elif results and "decisions" in results and "analyst_signals" in results:
+        # print_trading_output(results["decisions"], results["analyst_signals"])
+        # FIX: Pass the entire results dictionary as a single argument
+        print_trading_output(results)
     else:
-        print(f"{Fore.YELLOW}No decisions or errors returned from the agent.")
+        print(f"{Fore.YELLOW}No decisions or insufficient data returned from the agent to display output.")
 
     print("-" * 30)

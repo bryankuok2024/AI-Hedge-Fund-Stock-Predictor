@@ -11,7 +11,7 @@ from colorama import Fore, Style, init
 import numpy as np
 import itertools
 
-from llm.models import LLM_ORDER, get_model_info
+from llm.models import LLM_ORDER, get_model_info, get_default_model, ModelProvider
 from utils.analysts import ANALYST_ORDER
 from main import run_hedge_fund
 from tools.api import (
@@ -85,6 +85,9 @@ class Backtester:
                 } for ticker in tickers
             }
         }
+        # --- NEW: Initialize list to store raw data for DataFrame ---
+        self.trade_log_data = []
+        # -----------------------------------------------------------
 
     def execute_trade(self, ticker: str, action: str, quantity: float, current_price: float):
         """
@@ -166,8 +169,7 @@ class Backtester:
                 if not (math.isnan(realized_gain) or math.isinf(realized_gain)):
                     self.portfolio["realized_gains"][ticker]["long"] += realized_gain
                 else:
-                     print(f"Warning: Calculated NaN/inf realized gain for {ticker} sell. Gain not recorded.")
-
+                    print(f"Warning: Calculated NaN/inf realized gain for {ticker} sell. Gain not recorded.")
 
                 position["long"] -= sell_quantity
                 self.portfolio["cash"] += sell_quantity * current_price
@@ -280,6 +282,7 @@ class Backtester:
 
                 realized_gain = (avg_short_price - current_price) * cover_quantity
 
+                # Correct indentation for portion calculation
                 portion = 1.0
                 if position["short"] > 0:
                     portion = cover_quantity / position["short"]
@@ -300,7 +303,7 @@ class Backtester:
                 if not (math.isnan(realized_gain) or math.isinf(realized_gain)):
                     self.portfolio["realized_gains"][ticker]["short"] += realized_gain
                 else:
-                     print(f"Warning: Calculated NaN/inf realized gain for {ticker} cover. Gain not recorded.")
+                    print(f"Warning: Calculated NaN/inf realized gain for {ticker} cover. Gain not recorded.")
 
                 if position["short"] == 0:
                     position["short_cost_basis"] = 0.0
@@ -439,9 +442,22 @@ class Backtester:
                 model_name=self.model_name,
                 model_provider=self.model_provider,
                 selected_analysts=self.selected_analysts,
+                show_reasoning=False
             )
-            decisions = output["decisions"]
-            analyst_signals = output["analyst_signals"]
+            # decisions = output["decisions"]
+            # analyst_signals = output["analyst_signals"]
+            
+            # --- FIX: Safely get decisions and signals --- 
+            decisions = output.get("decisions", {}) # Use .get() with default {} if key missing
+            analyst_signals = output.get("analyst_signals", {}) # Also use .get() for safety
+            # ---------------------------------------------
+
+            # Check if core function reported an error explicitly
+            if output.get("error"):
+                print(f"Error reported from agent core: {output['error']}")
+                # Decide how to handle: skip day? Stop backtest?
+                # For now, let's print error and maybe skip trades for this day
+                decisions = {} # Reset decisions if core reported error
 
             # Execute trades for each ticker
             executed_trades = {}
@@ -507,20 +523,40 @@ class Backtester:
                 long_val = pos["long"] * current_prices[ticker]
                 short_val = pos["short"] * current_prices[ticker]
                 net_position_value = long_val - short_val
+                shares_owned = pos["long"] - pos["short"] # net shares
 
                 # Get the action and quantity from the decisions
                 action = decisions.get(ticker, {}).get("action", "hold")
-                quantity = executed_trades.get(ticker, 0)
-                
-                # Append the agent action to the table rows
+                # Use executed_trades which reflects what actually happened
+                executed_quantity = executed_trades.get(ticker, 0)
+
+                # --- NEW: Capture raw data for the trade log DataFrame ---
+                ticker_log_entry = {
+                    "Date": current_date_str,
+                    "Ticker": ticker,
+                    "Action": action,
+                    "ExecutedQuantity": executed_quantity, # Use the executed quantity
+                    "Price": current_prices[ticker],
+                    "SharesOwned": shares_owned,
+                    "PositionValue": net_position_value,
+                    "Bullish": bullish_count,
+                    "Bearish": bearish_count,
+                    "Neutral": neutral_count,
+                    "Cash": self.portfolio["cash"], # Add cash balance for this row
+                    "PortfolioValue": self.portfolio_values[-1]["Portfolio Value"] if self.portfolio_values else self.initial_capital # Get latest total value
+                }
+                self.trade_log_data.append(ticker_log_entry)
+                # -------------------------------------------------------
+
+                # Append the formatted agent action to the table rows for display
                 date_rows.append(
                     format_backtest_row(
                         date=current_date_str,
                         ticker=ticker,
                         action=action,
-                        quantity=quantity,
+                        quantity=executed_quantity, # Display executed quantity
                         price=current_prices[ticker],
-                        shares_owned=pos["long"] - pos["short"],  # net shares
+                        shares_owned=shares_owned,
                         position_value=net_position_value,
                         bullish_count=bullish_count,
                         bearish_count=bearish_count,
@@ -565,9 +601,29 @@ class Backtester:
             if len(self.portfolio_values) > 3:
                 self._update_performance_metrics(performance_metrics)
 
+        # --- MODIFICATION: Convert trade_log_data to DataFrame and store ---
+        # Remove old debug prints and problematic logic using table_rows
+
+        if self.trade_log_data:
+            # Create DataFrame directly from the list of dictionaries
+            self.trade_log = pd.DataFrame(self.trade_log_data)
+
+            # Optional: Define and reorder columns for consistency
+            log_columns = [
+                "Date", "Ticker", "Action", "ExecutedQuantity", "Price",
+                "SharesOwned", "PositionValue", "Bullish", "Bearish", "Neutral",
+                "Cash", "PortfolioValue"
+            ]
+            # Ensure all desired columns exist before reindexing
+            existing_cols = [col for col in log_columns if col in self.trade_log.columns]
+            self.trade_log = self.trade_log[existing_cols]
+        else:
+            self.trade_log = pd.DataFrame() # Create empty DataFrame if no data
+        # --------------------------------------------------------------------
+
         # Store the final performance metrics for reference in analyze_performance
         self.performance_metrics = performance_metrics
-        return performance_metrics
+        # return performance_metrics # This function now doesn't need to return metrics
 
     def _update_performance_metrics(self, performance_metrics):
         """Helper method to update performance metrics using daily returns."""
@@ -711,7 +767,26 @@ class Backtester:
         print(f"Max Consecutive Wins: {Fore.GREEN}{max_consecutive_wins}{Style.RESET_ALL}")
         print(f"Max Consecutive Losses: {Fore.RED}{max_consecutive_losses}{Style.RESET_ALL}")
 
-        return performance_df
+        # --- MODIFICATION: Collect metrics into a dictionary --- 
+        final_metrics = {
+            "Initial Capital": self.initial_capital,
+            "Final Portfolio Value": final_portfolio_value,
+            "Total Return %": total_return, # Keep % sign in key for clarity
+            "Sharpe Ratio": annualized_sharpe,
+            "Max Drawdown %": abs(max_drawdown), # Store as positive percentage
+            "Max Drawdown Date": max_drawdown_date,
+            "Win Rate %": win_rate,
+            "Win/Loss Ratio": win_loss_ratio,
+            "Avg Win %": avg_win * 100 if not math.isnan(avg_win) else 0, # Convert to percentage
+            "Avg Loss %": avg_loss * 100 if not math.isnan(avg_loss) else 0, # Convert to percentage
+            "Max Consecutive Wins": max_consecutive_wins,
+            "Max Consecutive Losses": max_consecutive_losses,
+            "Total Realized PnL": total_realized_gains # Add realized PnL
+        }
+        # -------------------------------------------------------
+
+        # return performance_df # OLD: Returned daily data DataFrame
+        return final_metrics # NEW: Return summary metrics dictionary
 
 
 ##### Run the Backtester (Refactored Core Logic) #####
@@ -722,10 +797,22 @@ def run_backtest_core(
     initial_capital: float = 100000.0, # Add default
     initial_margin_requirement: float = 0.0, # Add default
     selected_analysts: list[str] = None, # Add argument
-    model_name: str = "gpt-4o", # Add argument
-    model_provider: str = "OpenAI", # Add argument
+    # --- Use default model config --- 
+    model_name: str = None, # Remove old default
+    model_provider: str = None, # Remove old default
 ):
     """Core logic to run the backtest. Callable directly."""
+    # --- Determine Model --- 
+    if model_name and model_provider:
+         # Use provided model if both name and provider are given
+         pass
+    else:
+         # Otherwise, get the default model config
+         default_model_config = get_default_model()
+         model_name = default_model_config.model_name
+         model_provider = default_model_config.provider.value
+    # ---------------------
+    
     # Agent function is run_hedge_fund from main.py
     agent_func = run_hedge_fund # Use the refactored wrapper from main.py
 
@@ -763,14 +850,14 @@ def run_backtest_core(
     try:
          with contextlib.redirect_stdout(captured_stdout), contextlib.redirect_stderr(captured_stderr):
              # Pre-fetch data first (important for efficiency)
-             backtester.prefetch_data()
+             # backtester.prefetch_data() # Moved prefetch inside run_backtest
              # Run the backtest simulation loop
-             backtester.run_backtest() # Assuming this updates internal state
-             # Analyze performance
-             performance_metrics = backtester.analyze_performance()
-             # Try to get trade_log if it exists as an attribute
-             if hasattr(backtester, 'trade_log') and isinstance(backtester.trade_log, pd.DataFrame):
-                 trade_log = backtester.trade_log
+             backtester.run_backtest() # This populates backtester.trade_log
+             # Analyze performance - this now returns the metrics dict
+             performance_metrics_dict = backtester.analyze_performance()
+             # Try to get trade_log DataFrame from the attribute
+             # if hasattr(backtester, 'trade_log') and isinstance(backtester.trade_log, pd.DataFrame):
+             trade_log_df = backtester.trade_log # Directly access the attribute set in run_backtest
 
     except Exception as e:
          print(f"Error during backtest execution: {e}")
@@ -782,12 +869,13 @@ def run_backtest_core(
              "stderr": captured_stderr.getvalue(),
          }
 
-    print("Backtest complete. Analyzing performance...")
+    # print("Backtest complete. Analyzing performance...") # Moved print inside analyze_performance
 
     # Return results in a structured way
     return {
-        "performance_metrics": performance_metrics,
-        "trade_log": trade_log, # May be None if not implemented/retrieved
+        "performance_metrics": performance_metrics_dict, # Return the dict of summary metrics
+        "trade_log": trade_log_df, # Return the DataFrame of daily logs
+        "portfolio_values": backtester.portfolio_values, # <-- ADDED portfolio values
         "stdout": captured_stdout.getvalue(), # Include captured output
         "stderr": captured_stderr.getvalue(),
     }
@@ -832,7 +920,7 @@ if __name__ == "__main__":
     selected_analysts = None
     if args.analysts:
          selected_analysts = [a.strip() for a in args.analysts.split(',')]
-         print(f"Using specified analysts: {', '.join(Fore.GREEN + a.title().replace('_', ' ') + Style.RESET_ALL for a in selected_analysts)}\\n")
+         print(f"Using specified analysts: {', '.join(Fore.GREEN + a.title().replace('_', ' ') + Style.RESET_ALL for a in selected_analysts)}\n")
     else:
         # Interactive analyst selection
         choices = questionary.checkbox(
@@ -856,6 +944,8 @@ if __name__ == "__main__":
             selected_analysts = choices
             print(f"\nSelected analysts: {', '.join(Fore.GREEN + choice.title().replace('_', ' ') + Style.RESET_ALL for choice in selected_analysts)}\n")
 
+    # --- Model Selection (Get default first) --- 
+    default_model_config = get_default_model()
     model_choice = None
     model_provider = "Unknown"
     if args.model:
@@ -871,6 +961,7 @@ if __name__ == "__main__":
         model_choice_q = questionary.select(
             "Select your LLM model for backtesting:",
             choices=[questionary.Choice(display, value=value) for display, value, _ in LLM_ORDER],
+            default=default_model_config.model_name, # Use default model name
             style=questionary.Style([
                 ("selected", "fg:green bold"),
                 ("pointer", "fg:green bold"),
